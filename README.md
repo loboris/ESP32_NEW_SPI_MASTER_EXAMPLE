@@ -2,13 +2,14 @@
 
 #### Driver modifications
 
-* Number of the devices attached to the bus which uses hw CS can be 3 (*NO_CS*)
-* Additional devices which does not use hw CS can be attached to the bus, up to *NO_DEV*
-* Devices can have individual bus_configs, so different mosi, miso, sck pins can be configured for each device
+* Number of the devices attached to the bus which uses **hw** CS can be 3 (*NO_CS*)
+* Additional devices which does not use **hw** CS can be attached to the bus, up to *NO_DEV*
+* Additional parameter **spics_ext_io_num** ia added to *spi_device_interface_config_t*, it is automatically handled by **spi_device_select**/**spi_device_deselect** functions
+* Devices can have individual **bus_configs**, so different mosi, miso, sck pins can be configured for each device
 * Because of that, spi_bus_add_device() function has added parameter 'bus_config'
-* Reconfiguring the bus is done automaticaly
-* added device select/deselect functions
-* added NonDMA/no Transactions mode for direct transfer on the spi bus
+* Reconfiguring the bus is done automaticaly when using *spi_device_select()* function
+* added device select/deselect functions **spi_device_select**/**spi_device_deselect**
+* added **NonDMA/no Transactions** mode for direct transfer on the spi bus
 * added some helper functions
 
 #### Queued mode & DMA transfer
@@ -27,27 +28,28 @@ Direct transfer to SPI device is possible which can coexist with queued data tra
 Non queued transfers uses the semaphore (taken in select function & given in deselect function) to protect the transfer.
 
 Main function in this mode is **spi_transfer_data()**
-* it has 'trans' parameter which has to be configured the same way as for spi_device_transmit() function.
-* uses devices 'pre_cb' and 'post_cb'
-* transfer data bit size must be 8-bit multiples
-* if the divice is configured for half duplex mode (cfg.flags = SPI_DEVICE_HALFDUPLEX) data is read after sending (if any), otherwise, data is read while sending
-* if device uses hw CS (spics_io_num > 0), CS is activated before transfer and deactivated after transfer
-* if device uses external CS (spics_io_num <= 0 & spics_ext_io_num > 0) CS must be handled with spi_device_select/spi_device_deselect
+* it has **trans** parameter which has to be configured the same way as for *spi_device_transmit()* function.
+* uses devices **pre_cb** and **post_cb**
+* transfer data bit size must be **8-bit multiples**
+* if the divice is configured for half duplex mode (*cfg.flags = SPI_DEVICE_HALFDUPLEX*) data is read after sending (if any), otherwise, data is read while sending
+* if device uses hw CS (*spics_io_num > 0*), CS is activated before transfer and deactivated after transfer
+* if device uses external CS (*spics_io_num <= 0* & *spics_ext_io_num > 0*) CS must be handled with *spi_device_select*/*spi_device_deselect*
 * there is **no limit** for transmit/receive buffer size
 
-**Complete function decsriptions are available in the header file**
+**Complete function decsriptions are available in the header file** *spi_master.h*
 
 #### Example
 
 To run the example, attach ILI9341 based display module to ESP32. Default pins used are:
-mosi: 23
-miso: 19
- sck: 18
-  CS:  5 (display CS)
-  DC: 26 (display DC)
- TCS: 25 (touch screen CS)
+* mosi: 23
+* miso: 19
+*  sck: 18
+*   CS:  5 (display CS)
+*   DC: 26 (display DC)
+*  TCS: 25 (touch screen CS)
 
 **If you want to use different pins, change them in** *tftfunc.h*
+
 **if you dont have the touch screen, comment** *#define USE_TOUCH* in *spi_master_demo.c*
 
 
