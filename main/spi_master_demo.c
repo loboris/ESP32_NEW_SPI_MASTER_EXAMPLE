@@ -582,21 +582,21 @@ static void display_test(spi_device_handle_t spi, spi_device_handle_t tsspi)
 
 		// *** Print info
 		printf("-------------\r\n");
-		printf(" Disp clock = %u Hz (%u)\r\n", get_speed(spi), speeds[speed_idx]);
-		printf(" Lines(DMA) = %d ms\r\n",t1);
+		printf(" Disp clock = %5.2f MHz (%5.2f)\r\n", (float)((float)(get_speed(spi))/1000000.0), (float)(speeds[speed_idx])/1000000.0);
+		printf(" Lines(DMA) = %5d  ms (240 lines of 320 pixels)\r\n",t1);
 		printf(" Read check   ");
-		if (line_check == 0) printf("OK\r\n");
-		else printf("Err\r\n");
-		printf("      Lines = %d ms\r\n",t2);
+		if (line_check == 0) printf("   OK\r\n");
+		else printf("  Err\r\n");
+		printf("      Lines = %5d  ms (240 lines of 320 pixels)\r\n",t2);
 		printf(" Read check   ");
-		if (line_check1 == 0) printf("OK\r\n");
-		else printf("Err\r\n");
-		printf("Pixels(DMA) = %d ms\r\n",t3*4);
-		printf("     Pixels = %d ms\r\n",t4*4);
-		printf("        Cls = %d ms\r\n",t5);
+		if (line_check1 == 0) printf("   OK\r\n");
+		else printf("  Err\r\n");
+		printf("Pixels(DMA) = %5d  ms (160x120)\r\n",t3);
+		printf("     Pixels = %5d  ms (160x120)\r\n",t4);
+		printf("        Cls = %5d  ms (320x240)\r\n",t5);
 #ifdef USE_TOUCH
 		if (tz > 100) {
-			printf(" Touched at   (%d,%d)\r\n",tx,ty);
+			printf(" Touched at (%d,%d) [row TS values]\r\n",tx,ty);
 		}
 #endif
 		printf("-------------\r\n");
