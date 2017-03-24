@@ -2,15 +2,15 @@
 
 #### Driver modifications
 
-* Number of the devices attached to the bus which uses **hw** CS can be 3 (*NO_CS*)
+* Number of the devices attached to the bus which uses **hw** CS can be 3 (*NO_CS*) as in original driver
 * Additional devices which does not use **hw** CS can be attached to the bus, up to *NO_DEV*
-* Additional parameter **spics_ext_io_num** ia added to *spi_device_interface_config_t*, it is automatically handled by **spi_device_select**/**spi_device_deselect** functions
+* Additional parameter **spics_ext_io_num** is added to *spi_device_interface_config_t*, it is automatically handled by **spi_device_select**/**spi_device_deselect** functions
 * Devices can have individual **bus_configs**, so different mosi, miso, sck pins can be configured for each device
-* Because of that, spi_bus_add_device() function has added parameter 'bus_config'
+* Because of that, **spi_bus_add_device()** function has added parameter *bus_config*
 * Reconfiguring the bus is done automaticaly when using *spi_device_select()* function
-* added device select/deselect functions **spi_device_select**/**spi_device_deselect**
-* added **NonDMA/no Transactions** mode for direct transfer on the spi bus
-* added some helper functions
+* Device select/deselect functions **spi_device_select**/**spi_device_deselect** are added
+* Added **NonDMA/no Transactions** mode for direct transfer on the spi bus
+* Added some helper functions
 
 #### Queued mode & DMA transfer
 
