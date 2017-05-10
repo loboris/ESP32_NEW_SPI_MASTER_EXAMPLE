@@ -48,10 +48,15 @@ To run the example, attach ILI9341 based display module to ESP32. Default pins u
 *   DC: 26 (display DC)
 *  TCS: 25 (touch screen CS)
 
+---
+
 **If you want to use different pins, change them in** *tftfunc.h*
 
 **if you dont have the touch screen, comment** *#define USE_TOUCH* in *spi_master_demo.c*
 
+Using *make menuconfig* **select tick rate 1000** ( → Component config → FreeRTOS → Tick rate (Hz) ) to get more accurate timings
+
+---
 
 This code tests accessing ILI9341 based display in various modes and prints some timings.
 
@@ -69,3 +74,77 @@ If Touch screen is available, reading the touch coordinates (non calibrated) is 
 Some info about the ILI9341:
 It has an C/D line, which is connected to a GPIO here. It expects this line to be low for a command and high for data. We use a pre-transmit callback here to control that line: every transaction has as the user-definable argument the needed state of the D/C line and just before the transaction is sent, the callback will set this line to the correct state.
 
+---
+
+**Example output:**
+
+```
+SPI: bus initialized
+SPI: attached display device, speed=5000000
+SPI: bus uses native pins: true
+SPI: attached TS device, speed=2500000
+SPI: display init...
+OK
+-------------
+ Disp clock =  5.00 MHz ( 5.00)
+ Lines(DMA) =   918  ms (240 lines of 320 pixels)
+ Read check      OK
+      Lines =  1154  ms (240 lines of 320 pixels)
+ Read check      OK
+Pixels(DMA) =  2371  ms (160x120)
+     Pixels =   694  ms (160x120)
+        Cls =   259  ms (320x240)
+-------------
+-------------
+ Disp clock =  8.00 MHz ( 8.00)
+ Lines(DMA) =   940  ms (240 lines of 320 pixels)
+ Read check     Err
+      Lines =  1058  ms (240 lines of 320 pixels)
+ Read check      OK
+Pixels(DMA) =  4161  ms (160x120)
+     Pixels =   488  ms (160x120)
+        Cls =   167  ms (320x240)
+ Touched at (801,810) [row TS values]
+-------------
+-------------
+ Disp clock = 16.00 MHz (16.00)
+ Lines(DMA) =   942  ms (240 lines of 320 pixels)
+ Read check     Err
+      Lines =   978  ms (240 lines of 320 pixels)
+ Read check      OK
+Pixels(DMA) =  4363  ms (160x120)
+     Pixels =   314  ms (160x120)
+        Cls =    89  ms (320x240)
+-------------
+-------------
+ Disp clock = 20.00 MHz (20.00)
+ Lines(DMA) =   942  ms (240 lines of 320 pixels)
+ Read check     Err
+      Lines =   962  ms (240 lines of 320 pixels)
+ Read check      OK
+Pixels(DMA) =  4374  ms (160x120)
+     Pixels =   279  ms (160x120)
+        Cls =    73  ms (320x240)
+ Touched at (1104,1525) [row TS values]
+-------------
+-------------
+ Disp clock = 26.67 MHz (30.00)
+ Lines(DMA) =   953  ms (240 lines of 320 pixels)
+ Read check     Err
+      Lines =   946  ms (240 lines of 320 pixels)
+ Read check      OK
+Pixels(DMA) =  5248  ms (160x120)
+     Pixels =   247  ms (160x120)
+        Cls =    58  ms (320x240)
+-------------
+-------------
+ Disp clock = 40.00 MHz (40.00)
+ Lines(DMA) =   953  ms (240 lines of 320 pixels)
+ Read check     Err
+      Lines =   930  ms (240 lines of 320 pixels)
+ Read check      OK
+Pixels(DMA) =  5244  ms (160x120)
+     Pixels =   211  ms (160x120)
+        Cls =    42  ms (320x240)
+-------------
+```

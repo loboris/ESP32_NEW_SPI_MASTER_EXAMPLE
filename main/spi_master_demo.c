@@ -48,8 +48,6 @@
 
 #define DELAY 0x80
 
-//Transaction descriptors
-static spi_transaction_t trans[6];
 
 // Init for ILI7341
 // ----------------
@@ -208,8 +206,10 @@ static void ili_init(spi_device_handle_t spi)
 //because the D/C line needs to be toggled in the middle.)
 //This routine queues these commands up so they get sent as quickly as possible.
 //----------------------------------------------------------------------
-static void send_line(spi_device_handle_t spi, int ypos, uint16_t *line) 
+static void IRAM_ATTR send_line(spi_device_handle_t spi, int ypos, uint16_t *line) 
 {
+	//Transaction descriptors
+	static spi_transaction_t trans[6];
     esp_err_t ret;
     int x;
 
@@ -253,44 +253,106 @@ static void send_line(spi_device_handle_t spi, int ypos, uint16_t *line)
     //send_line_finish, which will wait for the transfers to be done and check their status.
 }
 
+static int zzz = 0;
+#include "esp_heap_alloc_caps.h"
+//-----------------------------------------------------------
+static void IRAM_ATTR get_line(spi_device_handle_t spi, uint16_t *line) 
+{
+	//Transaction descriptors
+	spi_transaction_t gtrans;
+    esp_err_t ret;
+    int x;
+	int nb = 61;
+	// Display sends pixel color as 3 byte RGB color, we need 320*3 bytes buffer to receive one line
+	// First received byte id dummy byte, so we add one more byte to buffer size
+	//uint8_t *rbuf =  malloc(blen);
+	uint8_t *rbuf = pvPortMallocCaps(3*320+1, MALLOC_CAP_DMA);
+	assert(rbuf != NULL);
+
+	memset(rbuf, 0x00, 3*nb);
+	memset(line, 0, 2*nb);
+
+    memset(&gtrans, 0, sizeof(spi_transaction_t));
+    gtrans.tx_buffer=NULL;            //send nothing
+    gtrans.length=0;                  //send nothing
+    gtrans.rx_buffer=rbuf;            //receive RGB data to buffer
+    gtrans.rxlength=8*nb;      //one line size in bits
+    gtrans.flags=0;                   //undo SPI_TRANS_USE_TXDATA flag
+
+    // ** Send address window **
+	disp_spi_transfer_addrwin(spi, 0, 319, 120, 120);
+    // ** GET pixels/colors **
+	disp_spi_transfer_cmd(spi, TFT_RAMRD);
+
+	ret=spi_device_transmit(spi, &gtrans);
+    assert(ret==ESP_OK);
+
+	printf("[%5d] Rd line, first 10 RGB values:", zzz);
+	for (int i=1;i<31;i++) {
+		printf(" %02x", rbuf[i]);
+	}
+	printf("\r\n");
+	/*printf("[%8d ] RDend   (%d):", zzz, rtrans->rxlength/8);
+	for (int i=rtrans->rxlength/8-rdl;i<rtrans->rxlength/8;i++) {
+		printf(" %02x", rrbuf[i]);
+	}
+	printf("\r\n");*/
+	// Convert RGB values received from display to 16-bit color values
+	int idx = 0;
+	uint16_t color;
+	uint8_t *buf = (uint8_t *)line;
+	for (int i=1; i<(nb); i+=3) {
+		//if ((rbuf[i] != 0) || (rbuf[i+1] != 0) || (rbuf[i+2] != 0xfc)) {
+		//	printf("        Err at %d [%02x %02x %02x]\r\n", i, rbuf[i], rbuf[i+1], rbuf[i+2]);
+		//}
+		color = (uint16_t)((uint16_t)(rbuf[i] & 0xF8) << 8) | (uint16_t)((rbuf[i+1] & 0xFC) << 3) | (uint16_t)(rbuf[i+2] >> 3);
+		buf[idx++] = color >> 8;
+		buf[idx++] = color & 0xFF;
+	}
+    free(rbuf);
+	zzz++;
+}
+
 // Send pixel using DMA transfer & transactions
 //-------------------------------------------------------------------------------------
-static void send_pixel(spi_device_handle_t spi, uint16_t x, uint16_t y, uint16_t color) 
+static void IRAM_ATTR send_pixel(spi_device_handle_t spi, uint16_t x, uint16_t y, uint16_t color) 
 {
+	//Transaction descriptors
+	spi_transaction_t ptrans[6];
     esp_err_t ret;
     int xx;
 
 	for (xx=0; xx<6; xx++) {
-        memset(&trans[xx], 0, sizeof(spi_transaction_t));
+        memset(&ptrans[xx], 0, sizeof(spi_transaction_t));
         if ((xx&1)==0) {
             //Even transfers are commands
-            trans[xx].length=8;
-            trans[xx].user=(void*)0;
+            ptrans[xx].length=8;
+            ptrans[xx].user=(void*)0;
         } else {
             //Odd transfers are data
-            trans[xx].length=8*4;
-            trans[xx].user=(void*)1;
+            ptrans[xx].length=8*4;
+            ptrans[xx].user=(void*)1;
         }
-        trans[xx].flags=SPI_TRANS_USE_TXDATA;
+        ptrans[xx].flags=SPI_TRANS_USE_TXDATA;
     }
-    trans[0].tx_data[0]=0x2A;        //Column Address Set
-    trans[1].tx_data[0]=x>>8;        //Start Col High
-    trans[1].tx_data[1]=x&0xff;      //Start Col Low
-    trans[1].tx_data[2]=(x+1)>>8;    //End Col High
-    trans[1].tx_data[3]=(x+1)&0xff;  //End Col Low
-    trans[2].tx_data[0]=0x2B;        //Page address set
-    trans[3].tx_data[0]=y>>8;        //Start page high
-    trans[3].tx_data[1]=y&0xff;      //start page low
-    trans[3].tx_data[2]=(y+1)>>8;    //end page high
-    trans[3].tx_data[3]=(y+1)&0xff;  //end page low
-    trans[4].tx_data[0]=0x2C;        //memory write
-    trans[5].tx_data[0]=color>>8;    //set color lo byte
-    trans[5].tx_data[1]=color&0xff;  //het color hi byte
-    trans[5].length=16;              //Data length, in bits
+    ptrans[0].tx_data[0]=0x2A;        //Column Address Set
+    ptrans[1].tx_data[0]=x>>8;        //Start Col High
+    ptrans[1].tx_data[1]=x&0xff;      //Start Col Low
+    ptrans[1].tx_data[2]=(x+1)>>8;    //End Col High
+    ptrans[1].tx_data[3]=(x+1)&0xff;  //End Col Low
+    ptrans[2].tx_data[0]=0x2B;        //Page address set
+    ptrans[3].tx_data[0]=y>>8;        //Start page high
+    ptrans[3].tx_data[1]=y&0xff;      //start page low
+    ptrans[3].tx_data[2]=(y+1)>>8;    //end page high
+    ptrans[3].tx_data[3]=(y+1)&0xff;  //end page low
+    ptrans[4].tx_data[0]=0x2C;        //memory write
+    ptrans[5].tx_data[0]=color>>8;    //set color lo byte
+    ptrans[5].tx_data[1]=color&0xff;  //het color hi byte
+    ptrans[5].length=16;              //Data length, in bits
 
     //Queue all transactions.
     for (xx=0; xx<6; xx++) {
-        ret=spi_device_queue_trans(spi, &trans[xx], portMAX_DELAY);
+        ret=spi_device_queue_trans(spi, &ptrans[xx], portMAX_DELAY);
         assert(ret==ESP_OK);
     }
 
@@ -310,7 +372,7 @@ static void send_pixel(spi_device_handle_t spi, uint16_t x, uint16_t y, uint16_t
 
 //Wait for all 6 transactions to be done and get back the results.
 //---------------------------------------------------
-static void send_line_finish(spi_device_handle_t spi) 
+static void IRAM_ATTR send_line_finish(spi_device_handle_t spi) 
 {
     spi_transaction_t *rtrans;
     esp_err_t ret;
@@ -339,6 +401,25 @@ uint16_t ts_cmd(spi_device_handle_t spi, const uint8_t cmd)
     t.rx_buffer=&rxdata;
     //ret=spi_device_transmit(spi, &t);  //Transmit!
     ret = spi_transfer_data(spi, &t);    // Transmit using direct mode
+    assert(ret==ESP_OK);                 //Should have had no issues.
+	//printf("TS: %02x,%02x,%02x,%02x\r\n",rxdata[0],rxdata[1],rxdata[2],rxdata[3]);
+    return (((uint16_t)(rxdata[1] << 8) | (uint16_t)(rxdata[2])) >> 4);
+}
+
+//---------------------------------------------------------------
+uint16_t ts_cmd_trans(spi_device_handle_t spi, const uint8_t cmd) 
+{
+    esp_err_t ret;
+    spi_transaction_t t;
+	uint8_t txdata[4] = {0};
+	uint8_t rxdata[4] = {0};
+	txdata[0] = cmd;
+    memset(&t, 0, sizeof(t));            //Zero out the transaction
+    t.length=8*3;                        //Command is 8 bits
+    t.rxlength=8*3;
+    t.tx_buffer=&txdata;
+    t.rx_buffer=&rxdata;
+    ret = spi_device_transmit(spi, &t);  //Transmit!
     assert(ret==ESP_OK);                 //Should have had no issues.
 	//printf("TS: %02x,%02x,%02x,%02x\r\n",rxdata[0],rxdata[1],rxdata[2],rxdata[3]);
     return (((uint16_t)(rxdata[1] << 8) | (uint16_t)(rxdata[2])) >> 4);
@@ -429,42 +510,53 @@ static uint16_t HSBtoRGB(float _hue, float _sat, float _brightness) {
 //--------------------------------------------------------------------------
 static void display_test(spi_device_handle_t spi, spi_device_handle_t tsspi) 
 {
-    uint32_t speeds[6] = {5000000,8000000,16000000,20000000,30000000,40000000};
-    int speed_idx = 0;
+    uint32_t speeds[7] = {5000000,8000000,16000000,20000000,30000000,40000000,80000000};
+    int speed_idx = 0, max_speed=6, max_rdspeed=99;
+    uint32_t change_speed, rd_clk;
 	esp_err_t ret;
     uint16_t line[3][320];
-    int x, y;
+    int x, y, ry;
     //Indexes of the line currently being sent to the LCD and the line we're calculating.
     int sending_line=-1;
     int calc_line=0;
 	int line_check=0, line_check1=0;
 	uint16_t color;
     uint32_t t1=0,t2=0,t3=0,t4=0,t5=0, tstart;
+	uint8_t clidx = 0;
 	float hue_inc;
 #ifdef USE_TOUCH
 	int tx, ty, tz=0;
 #endif
-    
+    zzz = 0;
+	int testn = 1;
     while(1) {
-		// *** Clear screen
-		color = 0;
+		// ===== Clear screen ===========================================
+		color = 0x0000;
 		ret = spi_device_select(spi, 0);
 		assert(ret==ESP_OK);
-		tstart = clock();
 		disp_spi_transfer_addrwin(spi, 0, 319, 0, 239);
 		disp_spi_transfer_cmd(spi, TFT_RAMWR);
 		disp_spi_transfer_color_rep(spi, (uint8_t *)&color,  320*240, 1);
-		t5 = clock() - tstart;
+
 		color = 0xFFFF;
-		disp_spi_transfer_addrwin(spi, 0, 319, 120, 120);
+		for (y=0;y<240;y+=20) {
+			disp_spi_transfer_addrwin(spi, 0, 319, y, y);
+			disp_spi_transfer_color_rep(spi, (uint8_t *)&color,  320, 1);
+		}
+		for (x=0;x<320;x+=20) {
+			disp_spi_transfer_addrwin(spi, x, x, 0, 239);
+			disp_spi_transfer_color_rep(spi, (uint8_t *)&color,  240, 1);
+		}
+		disp_spi_transfer_addrwin(spi, 0, 319, 239, 239);
 		disp_spi_transfer_color_rep(spi, (uint8_t *)&color,  320, 1);
-		disp_spi_transfer_addrwin(spi, 160, 160, 0, 239);
+		disp_spi_transfer_addrwin(spi, 319, 319, 0, 239);
 		disp_spi_transfer_color_rep(spi, (uint8_t *)&color,  240, 1);
 		vTaskDelay(1000 / portTICK_RATE_MS);
+
 		ret = spi_device_deselect(spi);
 		assert(ret==ESP_OK);
 
-		// *** display lines in DMA mode
+		// ==== display color lines in DMA mode ====================================
 		sending_line=-1;
 		calc_line=0;
 		line_check=-9999;
@@ -491,17 +583,36 @@ static void display_test(spi_device_handle_t spi, spi_device_handle_t tsspi)
             //touch line[sending_line]; the SPI sending process is still reading from that.
         }
         if (sending_line!=-1) send_line_finish(spi);
-		// Check line
-		ret = disp_spi_read_data(spi, 0, 120, 319, 120, 320, (uint8_t *)(line[0]));
-		if (ret == ESP_OK) line_check = memcmp((uint8_t *)(line[0]), (uint8_t *)(line[2]), 320*2);
-
 		ret =spi_device_deselect(spi);
 		assert(ret==ESP_OK);
-		t1 = clock() - tstart;
+		t4 = clock() - tstart;
+
+		vTaskDelay(10 / portTICK_RATE_MS);
+		ret = spi_device_select(spi, 0);
+		assert(ret==ESP_OK);
+		// Check line
+		//ret = disp_spi_read_data(spi, 0, 120, 319, 120, 320, (uint8_t *)(line[0]));
+		//if (ret == ESP_OK) line_check = memcmp((uint8_t *)(line[0]), (uint8_t *)(line[2]), 320*2);
+        //get_line(spi, 120, line[0],320);
+		disp_spi_read_data(spi, 0, 120, 319, 120, 320, (uint8_t *)(line[0]));
+		ret =spi_device_deselect(spi);
+		assert(ret==ESP_OK);
+
+		//line_check = memcmp((uint8_t *)(line[0]), (uint8_t *)(line[2]), 320*2);
+		for (x=0;x<320;x++) {
+			if (line[0][x] != line[2][x]) {
+				printf("err: %04x <> %04x\r\n",line[0][x],line[2][x]);
+				break;
+			}
+		}
+		if (x == 320) line_check1 = 0;
+		else line_check1 = x+1;
+
 		vTaskDelay(1000 / portTICK_RATE_MS);
 
-		// *** Display pixels using DMA/transactions mode
+		// ==== Display pixels using DMA/transactions mode ================================
 		//     It is slow, only write 1/4 of the screen
+		clidx = 0;
 		tstart = clock();
 		ret = spi_device_select(spi, 0);
 		assert(ret==ESP_OK);
@@ -510,17 +621,29 @@ static void display_test(spi_device_handle_t spi, spi_device_handle_t tsspi)
 				//disp_spi_transfer_addrwin(spi,x,x+1,y,y+1);
 				send_pixel(spi, x, y, 0x07E0);
 			}
+			if ((y > 0) && ((y % 20) == 0)) {
+				clidx++;
+				if (clidx > 5) clidx = 0;
+
+				if (clidx == 0) color = 0xF800;
+				else if (clidx == 1) color = 0x07E0;
+				else if (clidx == 2) color = 0x001F;
+				else if (clidx == 3) color = 0xFFE0;
+				else if (clidx == 4) color = 0xF81F;
+				else color = 0x07FF;
+			}
 		}
 		ret =spi_device_deselect(spi);
 		assert(ret==ESP_OK);
-		t3 = clock() - tstart;
+		t5 = clock() - tstart;
 		vTaskDelay(1000 / portTICK_RATE_MS);
 
-		// *** Send lines in direct mode
+		// ==== Send color lines in direct mode ======================================
+		ry = rand() % 239;
 		tstart = clock();
 		ret = spi_device_select(spi, 0);
 		assert(ret==ESP_OK);
-		line_check1=-9999;
+		line_check=-9999;
 		for (y=0; y<240; y++) {
 			hue_inc = (float)(((float)y / 239.0) * 360.0);
             for (x=0; x<320; x++) {
@@ -529,45 +652,95 @@ static void display_test(spi_device_handle_t spi, spi_device_handle_t tsspi)
 			}
 			disp_spi_transfer_addrwin(spi, 0, 319, y, y);
 			disp_spi_transfer_color_rep(spi, (uint8_t *)(line[0]),  320, 0);
-            if (y == 120) memcpy(line[2], line[0], 320*2);
+            if (y == ry) memcpy(line[1], line[0], 320*2);
 		}
+		t1 = clock() - tstart;
 		// Check line
-		ret = disp_spi_read_data(spi, 0, 120, 319, 120, 320, (uint8_t *)(line[0]));
-		if (ret == ESP_OK) line_check1 = memcmp((uint8_t *)(line[0]), (uint8_t *)(line[2]), 320*2);
+		if (speed_idx > max_rdspeed) {
+			// Set speed to max read speed
+			change_speed = set_speed(spi, speeds[max_rdspeed]);
+			assert(change_speed > 0 );
+			ret = spi_device_select(spi, 0);
+			assert(ret==ESP_OK);
+			rd_clk = speeds[max_rdspeed];
+		}
+		else rd_clk = speeds[speed_idx];
+
+		ret = disp_spi_read_data(spi, 0, ry, 319, ry, 320, (uint8_t *)(line[0]));
+		if (ret == ESP_OK) {
+            line_check = memcmp((uint8_t *)(line[0]), (uint8_t *)(line[1]), 320*2);
+        }
+		if (speed_idx > max_rdspeed) {
+			// Restore spi speed
+			change_speed = set_speed(spi, speeds[speed_idx]);
+			assert(change_speed > 0 );
+		}
 
 		ret =spi_device_deselect(spi);
 		assert(ret==ESP_OK);
-		t2 = clock() - tstart;
+		if (line_check) {
+			// Error checking line
+			if (max_rdspeed > speed_idx) {
+				// speed probably too high for read
+				if (speed_idx) max_rdspeed = speed_idx - 1;
+				else max_rdspeed = 0;
+				printf("### MAX READ SPI CLOCK = %d ###\r\n", speeds[max_rdspeed]);
+			}
+			else {
+				// Set new max spi clock, reinitialize the display
+				if (speed_idx) max_speed = speed_idx - 1;
+				else max_speed = 0;
+				printf("### MAX SPI CLOCK = %d ###\r\n", speeds[max_speed]);
+				speed_idx = 0;
+				set_speed(spi, speeds[speed_idx]);
+				ili_init(spi);
+				continue;
+			}
+        }
 		vTaskDelay(1000 / portTICK_RATE_MS);
 
-		// *** Display pixels using direct mode
+		// ==== Display pixels using direct mode ===================================
+		clidx = 0;
+		color = 0xF800;
 		tstart = clock();
 		ret = spi_device_select(spi, 0);
 		assert(ret==ESP_OK);
 		for (y=120; y<240; y++) {
 			for (x=160; x<320; x++) {
-				//disp_spi_transfer_addrwin(spi,x,x+1,y,y+1);
-				disp_spi_set_pixel(spi, x, y, 0x001f);
+				disp_spi_set_pixel(spi, x, y, color);
+			}
+			if ((y > 120) && ((y % 20) == 0)) {
+				clidx++;
+				if (clidx > 5) clidx = 0;
+
+				if (clidx == 0) color = 0xF800;
+				else if (clidx == 1) color = 0x07E0;
+				else if (clidx == 2) color = 0x001F;
+				else if (clidx == 3) color = 0xFFE0;
+				else if (clidx == 4) color = 0xF81F;
+				else color = 0x07FF;
 			}
 		}
 		ret = spi_device_deselect(spi);
 		assert(ret==ESP_OK);
-		t4 = clock() - tstart;
+		t2 = clock() - tstart;
 		vTaskDelay(1000 / portTICK_RATE_MS);
-		
-		// *** Clear screen using direct mode
-		color = 0xF800;
+
+		// ==== Clear screen using direct mode ==========================
+		color = 0xFFE0;
+		tstart = clock();
 		ret = spi_device_select(spi, 0);
 		assert(ret==ESP_OK);
-		disp_spi_transfer_addrwin(spi, 10, 309, 10, 229);
+		disp_spi_transfer_addrwin(spi, 0, 319, 0, 239);
 		disp_spi_transfer_cmd(spi, TFT_RAMWR);
-		disp_spi_transfer_color_rep(spi, (uint8_t *)&color,  310*230, 1);
+		disp_spi_transfer_color_rep(spi, (uint8_t *)&color,  320*240, 1);
 		ret = spi_device_deselect(spi);
 		assert(ret==ESP_OK);
+		t3 = clock() - tstart;
 		vTaskDelay(1000 / portTICK_RATE_MS);
 
 #ifdef USE_TOUCH
-		// Get toush status
+		// ==== Get touch status ===================================
 		ret = spi_device_select(tsspi, 0);
 		assert(ret==ESP_OK);
 		tz = ts_cmd(tsspi, 0xB0);
@@ -582,18 +755,19 @@ static void display_test(spi_device_handle_t spi, spi_device_handle_t tsspi)
 
 		// *** Print info
 		printf("-------------\r\n");
-		printf(" Disp clock = %5.2f MHz (%5.2f)\r\n", (float)((float)(get_speed(spi))/1000000.0), (float)(speeds[speed_idx])/1000000.0);
-		printf(" Lines(DMA) = %5d  ms (240 lines of 320 pixels)\r\n",t1);
-		printf(" Read check   ");
-		if (line_check == 0) printf("   OK\r\n");
-		else printf("  Err\r\n");
-		printf("      Lines = %5d  ms (240 lines of 320 pixels)\r\n",t2);
-		printf(" Read check   ");
-		if (line_check1 == 0) printf("   OK\r\n");
-		else printf("  Err\r\n");
-		printf("Pixels(DMA) = %5d  ms (160x120)\r\n",t3);
-		printf("     Pixels = %5d  ms (160x120)\r\n",t4);
-		printf("        Cls = %5d  ms (320x240)\r\n",t5);
+		printf("  Disp clock = %5.2f MHz (requested: %5.2f)\r\n", (float)((float)(get_speed(spi))/1000000.0), (float)(speeds[speed_idx])/1000000.0);
+		printf("       Lines = %5d  ms (240 lines of 320 pixels)\r\n",t1);
+		printf("  Read check   ");
+		if (line_check == 0) printf("   OK, line %d", ry);
+		else printf("  Err, line %d", ry);
+		if (speed_idx > max_rdspeed) {
+			printf(" (Read clock = %5.2f MHz)", (float)(rd_clk/1000000.0));
+		}
+		printf("\r\n");
+		printf(" Lines (DMA) = %5d  ms (240 lines of 320 pixels)\r\n",t4);
+		printf("      Pixels = %5d  ms (160x120)\r\n",t2);
+		printf("Pixels (DMA) = %5d  ms (160x120)\r\n",t5);
+		printf("         Cls = %5d  ms (320x240)\r\n",t3);
 #ifdef USE_TOUCH
 		if (tz > 100) {
 			printf(" Touched at (%d,%d) [row TS values]\r\n",tx,ty);
@@ -603,14 +777,19 @@ static void display_test(spi_device_handle_t spi, spi_device_handle_t tsspi)
 
 		// Change SPI speed
 		speed_idx++;
-		if (speed_idx > 5) speed_idx = 0;
-		set_speed(spi, speeds[speed_idx]);
+		if (speed_idx > max_speed) speed_idx = 0;
+		change_speed = set_speed(spi, speeds[speed_idx]);
+		assert(change_speed > 0 );
+		
+		testn++;
+		//if (testn > 8) break;
     }
 }
 
 //-------------
 void app_main()
 {
+	int dmach = 1;
     esp_err_t ret;
     spi_device_handle_t spi;
     spi_device_handle_t tsspi = NULL;
@@ -628,6 +807,7 @@ void app_main()
 		.spics_ext_io_num=PIN_NUM_CS,           //external CS pin
         .queue_size=7,                          //We want to be able to queue 7 transactions at a time
         .pre_cb=ili_spi_pre_transfer_callback,  //Specify pre-transfer callback to handle D/C line
+		.flags=SPI_DEVICE_HALFDUPLEX,           //Set half duplex mode (**IF NOT SET, READ FROM DISPLAY MEMORY WILL NOT WORK**)
     };
 
 #ifdef USE_TOUCH
@@ -642,7 +822,7 @@ void app_main()
 #endif
 
 	//Initialize the SPI bus
-    ret=spi_bus_initialize(SPI_BUS, &buscfg, 1);
+    ret=spi_bus_initialize(SPI_BUS, &buscfg, dmach);
     assert(ret==ESP_OK);
     //Attach the LCD to the SPI bus
     ret=spi_bus_add_device(SPI_BUS, &devcfg, &buscfg, &spi);
@@ -678,6 +858,29 @@ void app_main()
 	printf("OK\r\n");
 	vTaskDelay(500 / portTICK_RATE_MS);
 
-	//Start display test
-    display_test(spi, tsspi);
+	while (1) {
+		//Start display test
+		display_test(spi, tsspi);
+		
+		ret = spi_bus_remove_device(spi);
+		assert(ret==ESP_OK);
+		ret = spi_bus_remove_device(tsspi);
+		assert(ret==ESP_OK);
+		ret = spi_bus_free(SPI_BUS, 1);
+		assert(ret==ESP_OK);
+
+		vTaskDelay(500 / portTICK_RATE_MS);
+
+		dmach++;
+		if (dmach > 1) dmach = 1;
+		ret=spi_bus_initialize(SPI_BUS, &buscfg, dmach);
+		assert(ret==ESP_OK);
+		ret=spi_bus_add_device(SPI_BUS, &devcfg, &buscfg, &spi);
+		assert(ret==ESP_OK);
+#ifdef USE_TOUCH
+		ret=spi_bus_add_device(SPI_BUS, &tsdevcfg, &buscfg, &tsspi);
+		assert(ret==ESP_OK);
+#endif
+		ili_init(spi);
+	}
 }

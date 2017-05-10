@@ -297,6 +297,8 @@ esp_err_t spi_bus_initialize(spi_host_device_t host, spi_bus_config_t *bus_confi
 		spihost[host]->hw->dma_out_link.start=0;
 		spihost[host]->hw->dma_in_link.start=0;
 		spihost[host]->hw->dma_conf.val&=~(SPI_OUT_RST|SPI_AHBM_RST|SPI_AHBM_FIFO_RST);
+        //Reset timing
+        spihost[host]->hw->ctrl2.val=0;
 
 		//Disable unneeded ints
 		spihost[host]->hw->slave.rd_buf_done=0;
@@ -350,6 +352,7 @@ esp_err_t spi_bus_free(spi_host_device_t host, int dofree)
 esp_err_t spi_bus_add_device(spi_host_device_t host, spi_device_interface_config_t *dev_config, spi_bus_config_t *bus_config, spi_device_handle_t *handle)
 {
     int freecs, maxdev;
+    int apbclk=APB_CLK_FREQ;
     SPI_CHECK(host>=SPI_HOST && host<=VSPI_HOST, "invalid host", ESP_ERR_INVALID_ARG);
     SPI_CHECK(spihost[host]!=NULL, "host not initialized", ESP_ERR_INVALID_STATE);
     if (dev_config->spics_io_num >= 0) {
@@ -371,6 +374,9 @@ esp_err_t spi_bus_add_device(spi_host_device_t host, spi_device_interface_config
     //The hardware looks like it would support this, but actually setting cs_ena_pretrans when transferring in full
     //duplex mode does absolutely nothing on the ESP32.
     SPI_CHECK(dev_config->cs_ena_pretrans==0 || (dev_config->flags & SPI_DEVICE_HALFDUPLEX), "cs pretrans delay incompatible with full-duplex", ESP_ERR_INVALID_ARG);
+    //Speeds >=40MHz over GPIO matrix needs a dummy cycle, but these don't work for full-duplex connections.
+    SPI_CHECK(!( ((dev_config->flags & SPI_DEVICE_HALFDUPLEX)==0) && (dev_config->clock_speed_hz > ((apbclk*2)/5)) && (!spihost[host]->no_gpio_matrix)),
+            "No speeds >26MHz supported for full-duplex, GPIO-matrix SPI transfers", ESP_ERR_INVALID_ARG);
 
     //Allocate memory for device
     spi_device_t *dev=malloc(sizeof(spi_device_t));
@@ -440,12 +446,16 @@ esp_err_t spi_bus_remove_device(spi_device_handle_t handle)
     return ESP_OK;
 }
 
-static int spi_freq_for_pre_n(int fapb, int pre, int n) {
+static int IRAM_ATTR spi_freq_for_pre_n(int fapb, int pre, int n) {
     return (fapb / (pre * n));
 }
 
-static void spi_set_clock(spi_dev_t *hw, int fapb, int hz, int duty_cycle) {
-    int pre, n, h, l;
+/*
+ * Set the SPI clock to a certain frequency. Returns the effective frequency set, which may be slightly
+ * different from the requested frequency.
+ */
+static int IRAM_ATTR spi_set_clock(spi_dev_t *hw, int fapb, int hz, int duty_cycle) {
+    int pre, n, h, l, eff_clk;
 
     //In hw, n, h and l are 1-64, pre is 1-8K. Value written to register is one lower than used value.
     if (hz>((fapb/4)*3)) {
@@ -455,6 +465,7 @@ static void spi_set_clock(spi_dev_t *hw, int fapb, int hz, int duty_cycle) {
         hw->clock.clkcnt_n=0;
         hw->clock.clkdiv_pre=0;
         hw->clock.clk_equ_sysclk=1;
+        eff_clk=fapb;
     } else {
         //For best duty cycle resolution, we want n to be as close to 32 as possible, but
         //we also need a pre/n combo that gets us as close as possible to the intended freq.
@@ -490,7 +501,9 @@ static void spi_set_clock(spi_dev_t *hw, int fapb, int hz, int duty_cycle) {
         hw->clock.clkdiv_pre=pre-1;
         hw->clock.clkcnt_h=h-1;
         hw->clock.clkcnt_l=l-1;
+        eff_clk=spi_freq_for_pre_n(fapb, pre, n);
     }
+    return eff_clk;
 }
 
 
@@ -563,17 +576,37 @@ static void IRAM_ATTR spi_intr(void *arg)
         
         //Reconfigure according to device settings, but only if we change CSses.
         if (i!=prevCs) {
-			//Assumes a hardcoded 80MHz Fapb for now. ToDo: figure out something better once we have
-            //clock scaling working.
+			//Assumes a hardcoded 80MHz Fapb for now. ToDo: figure out something better once we have clock scaling working.
             int apbclk=APB_CLK_FREQ;
-            spi_set_clock(host->hw, apbclk, dev->cfg.clock_speed_hz, dev->cfg.duty_cycle_pos);
+
+            //Speeds >=40MHz over GPIO matrix needs a dummy cycle, but these don't work for full-duplex connections.
+            if (((dev->cfg.flags & SPI_DEVICE_HALFDUPLEX) == 0) && (dev->cfg.clock_speed_hz > ((apbclk*2)/5)) && (!host->no_gpio_matrix)) {
+                // set speed to 32 MHz
+                dev->cfg.clock_speed_hz = (apbclk*2)/5;
+            }
+
+            int effclk=spi_set_clock(host->hw, apbclk, dev->cfg.clock_speed_hz, dev->cfg.duty_cycle_pos);
             //Configure bit order
             host->hw->ctrl.rd_bit_order=(dev->cfg.flags & SPI_DEVICE_RXBIT_LSBFIRST)?1:0;
             host->hw->ctrl.wr_bit_order=(dev->cfg.flags & SPI_DEVICE_TXBIT_LSBFIRST)?1:0;
             
             //Configure polarity
-            //SPI iface needs to be configured for a delay unless it is not routed through GPIO and clock is >=apb/2
-            int nodelay=(host->no_gpio_matrix && dev->cfg.clock_speed_hz >= (apbclk/2));
+            //SPI iface needs to be configured for a delay in some cases.
+            int nodelay=0;
+            int extra_dummy=0;
+            if (host->no_gpio_matrix) {
+                if (effclk >= apbclk/2) {
+                    nodelay=1;
+                }
+            } else {
+                if (effclk >= apbclk/2) {
+                    nodelay=1;
+                    extra_dummy=1;          //Note: This only works on half-duplex connections. spi_bus_add_device checks for this.
+                } else if (effclk >= apbclk/4) {
+                    nodelay=1;
+                }
+            }
+
             if (dev->cfg.mode==0) {
                 host->hw->pin.ck_idle_edge=0;
                 host->hw->user.ck_out_edge=0;
@@ -593,11 +626,11 @@ static void IRAM_ATTR spi_intr(void *arg)
             }
 
             //Configure bit sizes, load addr and command
-            host->hw->user.usr_dummy=(dev->cfg.dummy_bits)?1:0;
+            host->hw->user.usr_dummy=(dev->cfg.dummy_bits+extra_dummy)?1:0;
             host->hw->user.usr_addr=(dev->cfg.address_bits)?1:0;
             host->hw->user.usr_command=(dev->cfg.command_bits)?1:0;
             host->hw->user1.usr_addr_bitlen=dev->cfg.address_bits-1;
-            host->hw->user1.usr_dummy_cyclelen=dev->cfg.dummy_bits-1;
+            host->hw->user1.usr_dummy_cyclelen=dev->cfg.dummy_bits+extra_dummy-1;
             host->hw->user2.usr_command_bitlen=dev->cfg.command_bits-1;
             //Configure misc stuff
             host->hw->user.doutdin=(dev->cfg.flags & SPI_DEVICE_HALFDUPLEX)?0:1;
@@ -614,7 +647,7 @@ static void IRAM_ATTR spi_intr(void *arg)
             host->hw->pin.cs2_dis=(i==2)?0:1;
         }
         //Reset DMA
-        host->hw->dma_conf.val |= SPI_OUT_RST|SPI_AHBM_RST|SPI_AHBM_FIFO_RST;
+		host->hw->dma_conf.val |= SPI_OUT_RST|SPI_AHBM_RST|SPI_AHBM_FIFO_RST;
         host->hw->dma_out_link.start=0;
         host->hw->dma_in_link.start=0;
         host->hw->dma_conf.val &= ~(SPI_OUT_RST|SPI_AHBM_RST|SPI_AHBM_FIFO_RST);
@@ -660,7 +693,7 @@ static void IRAM_ATTR spi_intr(void *arg)
                 host->dmadesc_rx.eof=1;
                 host->dmadesc_rx.sosf=0;
                 host->dmadesc_rx.owner=1;
-                host->hw->dma_in_link.addr=(int)(&host->dmadesc_rx)&0xFFFFF;
+                host->hw->dma_in_link.addr=(int)(&host->dmadesc_rx) & 0xFFFFF;
                 host->hw->dma_in_link.start=1;
             }
             host->hw->user.usr_miso=1;
@@ -759,7 +792,7 @@ esp_err_t spi_device_transmit(spi_device_handle_t handle, spi_transaction_t *tra
 //===== Functions used in non-DMA, not queued mode ===============
 // ===============================================================
 
-esp_err_t spi_device_select(spi_device_handle_t handle, int force)
+esp_err_t IRAM_ATTR spi_device_select(spi_device_handle_t handle, int force)
 {
 	if ((handle->cfg.selected == 1) && (!force)) return ESP_OK;
 
@@ -799,39 +832,59 @@ esp_err_t spi_device_select(spi_device_handle_t handle, int force)
 		//Assumes a hardcoded 80MHz Fapb for now. ToDo: figure out something better once we have
 		//clock scaling working.
 		int apbclk=APB_CLK_FREQ;
-		spi_set_clock(host->hw, apbclk, handle->cfg.clock_speed_hz, handle->cfg.duty_cycle_pos);
+
+        //Speeds >=40MHz over GPIO matrix needs a dummy cycle, but these don't work for full-duplex connections.
+        if (((handle->cfg.flags & SPI_DEVICE_HALFDUPLEX) == 0) && (handle->cfg.clock_speed_hz > ((apbclk*2)/5)) && (!host->no_gpio_matrix)) {
+            // set speed to 32 MHz
+            handle->cfg.clock_speed_hz = (apbclk*2)/5;
+        }
+
+        int effclk=spi_set_clock(host->hw, apbclk, handle->cfg.clock_speed_hz, handle->cfg.duty_cycle_pos);
 		//Configure bit order
 		host->hw->ctrl.rd_bit_order=(handle->cfg.flags & SPI_DEVICE_RXBIT_LSBFIRST)?1:0;
 		host->hw->ctrl.wr_bit_order=(handle->cfg.flags & SPI_DEVICE_TXBIT_LSBFIRST)?1:0;
 		
 		//Configure polarity
-		//SPI iface needs to be configured for a delay unless it is not routed through GPIO and clock is >=apb/2
-		int nodelay=(host->no_gpio_matrix && handle->cfg.clock_speed_hz >= (apbclk/2));
-		if (handle->cfg.mode==0) {
-			host->hw->pin.ck_idle_edge=0;
-			host->hw->user.ck_out_edge=0;
-			host->hw->ctrl2.miso_delay_mode=nodelay?0:2;
-		} else if (handle->cfg.mode==1) {
-			host->hw->pin.ck_idle_edge=0;
-			host->hw->user.ck_out_edge=1;
-			host->hw->ctrl2.miso_delay_mode=nodelay?0:1;
-		} else if (handle->cfg.mode==2) {
-			host->hw->pin.ck_idle_edge=1;
-			host->hw->user.ck_out_edge=1;
-			host->hw->ctrl2.miso_delay_mode=nodelay?0:1;
-		} else if (handle->cfg.mode==3) {
-			host->hw->pin.ck_idle_edge=1;
-			host->hw->user.ck_out_edge=0;
-			host->hw->ctrl2.miso_delay_mode=nodelay?0:2;
-		}
+        //SPI iface needs to be configured for a delay in some cases.
+        int nodelay=0;
+        int extra_dummy=0;
+        if (host->no_gpio_matrix) {
+            if (effclk >= apbclk/2) {
+                nodelay=1;
+            }
+        } else {
+            if (effclk >= apbclk/2) {
+                nodelay=1;
+                extra_dummy=1;          //Note: This only works on half-duplex connections. spi_bus_add_device checks for this.
+            } else if (effclk >= apbclk/4) {
+                nodelay=1;
+            }
+        }
+        if (handle->cfg.mode==0) {
+            host->hw->pin.ck_idle_edge=0;
+            host->hw->user.ck_out_edge=0;
+            host->hw->ctrl2.miso_delay_mode=nodelay?0:2;
+        } else if (handle->cfg.mode==1) {
+            host->hw->pin.ck_idle_edge=0;
+            host->hw->user.ck_out_edge=1;
+            host->hw->ctrl2.miso_delay_mode=nodelay?0:1;
+        } else if (handle->cfg.mode==2) {
+            host->hw->pin.ck_idle_edge=1;
+            host->hw->user.ck_out_edge=1;
+            host->hw->ctrl2.miso_delay_mode=nodelay?0:1;
+        } else if (handle->cfg.mode==3) {
+            host->hw->pin.ck_idle_edge=1;
+            host->hw->user.ck_out_edge=0;
+            host->hw->ctrl2.miso_delay_mode=nodelay?0:2;
+        }
 
-		//Configure bit sizes, load addr and command
-		host->hw->user.usr_dummy=(handle->cfg.dummy_bits)?1:0;
-		host->hw->user.usr_addr=(handle->cfg.address_bits)?1:0;
-		host->hw->user.usr_command=(handle->cfg.command_bits)?1:0;
-		host->hw->user1.usr_addr_bitlen=handle->cfg.address_bits-1;
-		host->hw->user1.usr_dummy_cyclelen=handle->cfg.dummy_bits-1;
-		host->hw->user2.usr_command_bitlen=handle->cfg.command_bits-1;
+        //Configure bit sizes, load addr and command
+        host->hw->user.usr_dummy=(handle->cfg.dummy_bits+extra_dummy)?1:0;
+        host->hw->user.usr_addr=(handle->cfg.address_bits)?1:0;
+        host->hw->user.usr_command=(handle->cfg.command_bits)?1:0;
+        host->hw->user1.usr_addr_bitlen=handle->cfg.address_bits-1;
+        host->hw->user1.usr_dummy_cyclelen=handle->cfg.dummy_bits+extra_dummy-1;
+        host->hw->user2.usr_command_bitlen=handle->cfg.command_bits-1;
 		//Configure misc stuff
 		host->hw->user.doutdin=(handle->cfg.flags & SPI_DEVICE_HALFDUPLEX)?0:1;
 		host->hw->user.sio=(handle->cfg.flags & SPI_DEVICE_3WIRE)?1:0;
@@ -857,7 +910,7 @@ esp_err_t spi_device_select(spi_device_handle_t handle, int force)
 	return ESP_OK;
 }
 
-esp_err_t spi_device_deselect(spi_device_handle_t handle)
+esp_err_t IRAM_ATTR spi_device_deselect(spi_device_handle_t handle)
 {
 	if (handle->cfg.selected == 0) return ESP_OK;
 
@@ -887,14 +940,14 @@ esp_err_t spi_device_deselect(spi_device_handle_t handle)
 	return ESP_OK;
 }
 
-esp_err_t spi_device_TakeSemaphore(spi_device_handle_t handle)
+esp_err_t IRAM_ATTR spi_device_TakeSemaphore(spi_device_handle_t handle)
 {
 	xSemaphoreTake(handle->host->spi_bus_mutex, portMAX_DELAY);
 	if (!(xSemaphoreTake(handle->host->spi_bus_mutex, 5000))) return ESP_ERR_INVALID_STATE;
 	else return ESP_OK;
 }
 
-void spi_device_GiveSemaphore(spi_device_handle_t handle)
+void IRAM_ATTR spi_device_GiveSemaphore(spi_device_handle_t handle)
 {
 	xSemaphoreTake(handle->host->spi_bus_mutex, portMAX_DELAY);
 }
@@ -941,179 +994,261 @@ void spi_get_native_pins(int host, int *sdi, int *sdo, int *sck)
 	*sck = io_signal[host].spiclk_native;
 }
 
-// device must be selected!
-//-------------------------------------------------------------------------------------------
+/*
+When using  'spi_transfer_data' function we can have several scenarios:
+
+A: Send only      (trans->rxlength = 0)
+B: Receive only   (trans->txlength = 0)
+C: Send & receive (trans->txlength > 0 & trans->rxlength > 0)
+D: No operation   (trans->txlength = 0 & trans->rxlength = 0)
+
+*/
+//-------------------------------------------------------------------------------------------------------------
 esp_err_t IRAM_ATTR spi_transfer_data(spi_device_handle_t handle, spi_transaction_t *trans) {
-	if (!handle) return ESP_ERR_INVALID_ARG;
-	// only handle 8-bit bytes transmission
-	if (((trans->length % 8) != 0) || ((trans->rxlength % 8) != 0)) return ESP_ERR_INVALID_ARG;
+    if (!handle) return ESP_ERR_INVALID_ARG;
 
-	spi_host_t *host=(spi_host_t*)handle->host;
-    const uint8_t *data = NULL;
-	uint8_t *indata = NULL;
+    // *** For now we can only handle 8-bit bytes transmission
+    if (((trans->length % 8) != 0) || ((trans->rxlength % 8) != 0)) return ESP_ERR_INVALID_ARG;
 
-	if (trans->flags & SPI_TRANS_USE_TXDATA) {
-		data=(uint8_t*)&trans->tx_data[0];
-	} else {
-		data=(uint8_t*)trans->tx_buffer;
-	}
-	if (trans->flags & SPI_TRANS_USE_RXDATA) {
-		indata=(uint8_t*)&trans->rx_data[0];
-	} else {
-		indata=(uint8_t*)trans->rx_buffer;
-	}
+    spi_host_t *host=(spi_host_t*)handle->host;
+    esp_err_t ret;
+    uint8_t do_deselect = 0;
+    const uint8_t *txbuffer = NULL;
+    uint8_t *rxbuffer = NULL;
 
-	uint32_t wrlen = trans->length / 8;
-	uint32_t rdlen = trans->rxlength / 8;
-
-	if (data == NULL) wrlen = 0;
-	if (indata == NULL) rdlen = 0;
-	if ((rdlen == 0) && (wrlen == 0)) return ESP_ERR_INVALID_ARG;
-
-	if ((data == &trans->tx_data[0]) && (wrlen > 4)) return ESP_ERR_INVALID_ARG;
-	if ((indata == &trans->rx_data[0]) && (rdlen > 4)) return ESP_ERR_INVALID_ARG;
-
-	// Wait for SPI bus ready
-	while (host->hw->cmd.usr);
-
-	//Call pre-transmission callback, if any
-	if (host->device[host->cur_device]->cfg.pre_cb) {
-		host->device[host->cur_device]->cfg.pre_cb(trans);
-	}
-
-	uint8_t duplex = 1;
-	if (handle->cfg.flags & SPI_DEVICE_HALFDUPLEX) duplex = 0;
-	uint32_t bits, rdbits;
-	uint32_t wd;
-	uint8_t bc, rdidx;
-	uint32_t rdcount = rdlen;
-	uint32_t rd_read = 0;
-
-	host->hw->user.usr_mosi_highpart = 0;
-	if ((data != NULL) && (wrlen > 0)) host->hw->user.usr_mosi = 1;
-	else host->hw->user.usr_mosi = 0;
-
-	if ((indata != NULL) && (rdlen > 0)) host->hw->user.usr_miso = 1;
-	else host->hw->user.usr_miso = 0;
-
-	if (host->hw->user.usr_mosi == 1) {
-		// === We have some data to send ===
-		uint8_t idx;
-		uint32_t count;
-
-		bits = 0;
-		rdbits = 0;
-		idx = 0;
-		count = 0;
-
-		while (count < wrlen) {
-			wd = 0;
-			for (bc=0;bc<32;bc+=8) {
-				wd |= (uint32_t)data[count] << bc;
-				count++;
-				bits += 8;
-				if (count == wrlen) break;
-			}
-			host->hw->data_buf[idx] = wd;
-			idx++;
-			if (idx == 16) {
-				// SPI buffer full, transfer data
-				host->hw->mosi_dlen.usr_mosi_dbitlen=bits-1;
-				if (duplex) {
-			    	if (rdcount <= 64) rdbits = rdcount * 8;
-			    	else rdbits = 64 * 8;
-					host->hw->mosi_dlen.usr_mosi_dbitlen = rdbits-1;
-				}
-				else host->hw->miso_dlen.usr_miso_dbitlen = 0;
-				// Start transfer
-				host->hw->cmd.usr=1;
-				while (host->hw->cmd.usr);
-
-				if ((duplex) && (host->hw->user.usr_miso = 1)) {
-					// in duplex mode transfer received data to input buffer
-					rdidx = 0;
-			    	while (rdbits > 0) {
-						wd = host->hw->data_buf[rdidx];
-						rdidx++;
-						for (bc=0;bc<32;bc+=8) {
-							indata[rd_read++] = (uint8_t)((wd >> bc) & 0xFF);
-							rdcount--;
-							rdbits -= 8;
-							if (rdcount == 0) break;
-						}
-			    	}
-				}
-
-				bits = 0;
-				idx = 0;
-			}
-		}
-		if (bits > 0) {
-			// more data waits for transfer
-			host->hw->mosi_dlen.usr_mosi_dbitlen=bits-1;
-			if (duplex) {
-		    	if (rdcount <= 64) rdbits = rdcount * 8;
-		    	else rdbits = 64 * 8;
-				host->hw->mosi_dlen.usr_mosi_dbitlen = rdbits-1;
-			}
-			else host->hw->miso_dlen.usr_miso_dbitlen = 0;
-			// Start transfer
-			host->hw->cmd.usr=1;
-			// Wait for SPI bus ready
-			while (host->hw->cmd.usr);
-
-			if ((duplex) && (host->hw->user.usr_miso = 1)) {
-				// transfer received data to input buffer
-				rdidx = 0;
-		    	while (rdbits > 0) {
-					wd = host->hw->data_buf[rdidx];
-					rdidx++;
-					for (bc=0;bc<32;bc+=8) {
-						indata[rd_read++] = (uint8_t)((wd >> bc) & 0xFF);
-						rdcount--;
-						rdbits -= 8;
-						if (rdcount == 0) break;
-					}
-		    	}
-			}
-		}
-		if (duplex) rdcount = 0;
-	}
-
-	if (rdcount == 0) {
-		//Call post-transaction callback, if any
-		if (host->device[host->cur_device]->cfg.post_cb) host->device[host->cur_device]->cfg.post_cb(trans);
-		return ESP_OK;
-	}
-
-	// Read data (after sending)
-    while (rdcount > 0) {
-    	if (rdcount <= 64) rdbits = rdcount * 8;
-    	else rdbits = 64 * 8;
-
-		// Load receive buffer
-		host->hw->mosi_dlen.usr_mosi_dbitlen=0;
-		host->hw->miso_dlen.usr_miso_dbitlen=rdbits-1;
-		// Start transfer
-		host->hw->cmd.usr=1;
-		// Wait for SPI bus ready
-		while (host->hw->cmd.usr);
-
-		rdidx = 0;
-    	while (rdbits > 0) {
-			wd = host->hw->data_buf[rdidx];
-			rdidx++;
-			for (bc=0;bc<32;bc+=8) {
-				indata[rd_read++] = (uint8_t)((wd >> bc) & 0xFF);
-				rdcount--;
-				rdbits -= 8;
-				if (rdcount == 0) break;
-			}
-    	}
+    if (trans->flags & SPI_TRANS_USE_TXDATA) {
+        // Send data from 'trans->tx_data'
+        txbuffer=(uint8_t*)&trans->tx_data[0];
+    } else {
+        // Send data from 'trans->tx_buffer'
+        txbuffer=(uint8_t*)trans->tx_buffer;
+    }
+    if (trans->flags & SPI_TRANS_USE_RXDATA) {
+        // Receive data to 'trans->rx_data'
+        rxbuffer=(uint8_t*)&trans->rx_data[0];
+    } else {
+        // Receive data to 'trans->rx_buffer'
+        rxbuffer=(uint8_t*)trans->rx_buffer;
     }
 
-	//Call post-transaction callback, if any
-	if (host->device[host->cur_device]->cfg.post_cb) host->device[host->cur_device]->cfg.post_cb(trans);
-	return ESP_OK;
-}
+    // ** Set transmit & receive length in bytes
+    uint32_t txlen = trans->length / 8;
+    uint32_t rxlen = trans->rxlength / 8;
 
+    if (txbuffer == NULL) txlen = 0;
+    if (rxbuffer == NULL) rxlen = 0;
+    if ((rxlen == 0) && (txlen == 0)) {
+        // ** NOTHING TO SEND or RECEIVE, return
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    // If using 'trans->tx_data' and/or 'trans->rx_data', maximum 4 bytes can be sent/received
+    if ((txbuffer == &trans->tx_data[0]) && (txlen > 4)) return ESP_ERR_INVALID_ARG;
+    if ((rxbuffer == &trans->rx_data[0]) && (rxlen > 4)) return ESP_ERR_INVALID_ARG;
+
+    // --- Wait for SPI bus ready ---
+    while (host->hw->cmd.usr);
+
+    // ** If the device was not selected, select it
+    if (handle->cfg.selected == 0) {
+        ret = spi_device_select(handle, 0);
+        if (ret) return ret;
+        do_deselect = 1;     // We will deselect the device after the operation !
+    }
+    
+    // ** Call pre-transmission callback, if any
+    if (handle->cfg.pre_cb) handle->cfg.pre_cb(trans);
+
+    // Test if operating in full duplex mode
+    uint8_t duplex = 1;
+    if (handle->cfg.flags & SPI_DEVICE_HALFDUPLEX) duplex = 0; // Half duplex mode !
+
+    uint32_t bits, rdbits;
+    uint32_t wd;
+    uint8_t bc, rdidx;
+    uint32_t rdcount = rxlen;  // Total number of bytes to read
+    uint32_t rd_read = 0;      // Number of bytes read so far
+
+    host->hw->user.usr_mosi_highpart = 0;
+
+    // ** Check if mosi phase will be used
+    if ((txbuffer != NULL) && (txlen > 0)) host->hw->user.usr_mosi = 1;  // We have to send some data
+    else host->hw->user.usr_mosi = 0;                                    // Nothing to send, no mosi phase
+
+    // ** Check if miso phase will be used
+    if ((rxbuffer != NULL) && (rxlen > 0)) host->hw->user.usr_miso = 1;  // We have to receive some data
+    else host->hw->user.usr_miso = 0;                                    // Nothing to receive, no miso phase
+
+    // ** Check if address phase will be used
+    host->hw->user2.usr_command_value=trans->command;
+    if (handle->cfg.address_bits>32) {
+        host->hw->addr=trans->address >> 32;
+        host->hw->slv_wr_status=trans->address & 0xffffffff;
+    } else {
+        host->hw->addr=trans->address & 0xffffffff;
+    }
+
+    // ---------------------------------------------------------------------
+    // *** If host->hw->user.usr_mosi == 1 we have to transmit some data ***
+    //     host->hw->user.usr_mosi == 0  if no data needs to be transmitted
+    // ---------------------------------------------------------------------
+    if (host->hw->user.usr_mosi == 1) {
+        uint8_t idx;
+        uint32_t count;
+
+        bits = 0;   // remaining bits to send
+        rdbits = 0; // remaining bits to receive
+        idx = 0;    // index to spi hw data_buf (16 32-bit words, 64 bytes, 512 bits)
+        count = 0;  // number of bytes transmitted so far
+
+        // ** Transimit 'txlen' bytes
+        while (count < txlen) {
+            wd = 0;
+            for (bc=0;bc<32;bc+=8) {
+                wd |= (uint32_t)txbuffer[count] << bc;
+                count++;                    // Increment sent data count
+                bits += 8;                  // Increment bits count
+                if (count == txlen) break;  // If all transmit data pushed to hw spi buffer break from the loop
+            }
+            host->hw->data_buf[idx] = wd;
+            idx++;
+            if (idx == 16) {
+                // Hw SPI buffer full (all 64 bytes filled, START THE TRANSSACTION
+                host->hw->mosi_dlen.usr_mosi_dbitlen=bits-1;            // Set mosi dbitlen
+
+                if ((duplex) && (host->hw->user.usr_miso == 1)) {
+                    // In full duplex mode we are receiving while sending !
+                    if (rdcount <= 64) rdbits = rdcount * 8;
+                    else rdbits = 64 * 8;
+                    host->hw->mosi_dlen.usr_mosi_dbitlen = rdbits-1;    // Set miso dbitlen
+                }
+                else host->hw->miso_dlen.usr_miso_dbitlen = 0;          // In half duplex mode nothing will be received
+
+                // ** Start the transaction ***
+                host->hw->cmd.usr=1;
+                // Wait the transaction to finish
+                while (host->hw->cmd.usr);
+
+                if ((duplex) && (host->hw->user.usr_miso == 1)) {
+                    // *** in full duplex mode transfer received data to input buffer ***
+                    rdidx = 0;
+                    while (rdbits > 0) {
+                        wd = host->hw->data_buf[rdidx];
+                        rdidx++;
+                        for (bc=0;bc<32;bc+=8) {
+                            rxbuffer[rd_read++] = (uint8_t)((wd >> bc) & 0xFF);
+                            rdcount--;
+                            rdbits -= 8;
+                            if (rdcount == 0) {
+                                // Finished reading data
+                                host->hw->user.usr_miso = 0;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                bits = 0;   // nothing in hw spi buffer yet
+                idx = 0;    // start from the begining of the hw spi buffer
+            }
+        }
+        // *** All transmit data are sent or oushed to hw spi buffer
+        // bits > 0  IF SOME DATA STILL WAITING IN THE HW SPI TRANSMIT BUFFER
+        if (bits > 0) {
+            // ** WE HAVE SOME DATA IN THE HW SPI TRANSMIT BUFFER
+            host->hw->mosi_dlen.usr_mosi_dbitlen=bits-1;            // Set mosi dbitlen
+
+            if ((duplex) && (host->hw->user.usr_miso == 1)) {
+                // In full duplex mode we are receiving while sending !
+                if (rdcount <= 64) rdbits = rdcount * 8;
+                else rdbits = 64 * 8;
+                host->hw->mosi_dlen.usr_mosi_dbitlen = rdbits-1;    // Set miso dbitlen
+            }
+            else host->hw->miso_dlen.usr_miso_dbitlen = 0;          // In half duplex mode nothing will be received
+
+            // ** Start the transaction ***
+            host->hw->cmd.usr=1;
+            // Wait the transaction to finish
+            while (host->hw->cmd.usr);
+
+            if ((duplex) && (host->hw->user.usr_miso == 1))  {
+                // *** in full duplex mode transfer received data to input buffer ***
+                rdidx = 0;
+                while (rdbits > 0) {
+                    wd = host->hw->data_buf[rdidx];
+                    rdidx++;
+                    for (bc=0;bc<32;bc+=8) {
+                        rxbuffer[rd_read++] = (uint8_t)((wd >> bc) & 0xFF);
+                        rdcount--;
+                        rdbits -= 8;
+                        if (rdcount == 0) {
+                            // Finished reading data
+                            host->hw->user.usr_miso = 0;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if (duplex) rdcount = 0;
+    }
+
+    // ------------------------------------------------------------------------
+    // *** If rdcount = 0 we have nothing to receive and we exit the function
+    //     This is true if no data receive was requested,
+    //     or the data was received in Full duplex mode during the transmission
+    // ------------------------------------------------------------------------
+    if (rdcount == 0) {
+        // ** Call post-transmission callback, if any
+        if (handle->cfg.post_cb) handle->cfg.post_cb(trans);
+
+        if (do_deselect) {
+            // Spi device was selected in this function, we have to deselect it now 
+            ret = spi_device_deselect(handle);
+            if (ret) return ret;
+        }
+        return ESP_OK;
+    }
+
+    // ----------------------------------------------------------------------------------------------------------------
+    // *** If rdcount > 0 we have to receive some data
+    //     This is true if we operate in Half duplex mode when receiving after transmission is done,
+    //     or not all data was received in Full duplex mode during the transmission (trans->rxlength > trans->txlength)
+    // ----------------------------------------------------------------------------------------------------------------
+    while (rdcount > 0) {
+        if (rdcount <= 64) rdbits = rdcount * 8;
+        else rdbits = 64 * 8;
+
+        // Load receive buffer
+        host->hw->mosi_dlen.usr_mosi_dbitlen=0;
+        host->hw->miso_dlen.usr_miso_dbitlen=rdbits-1;
+
+        // ** Start the transaction ***
+        host->hw->cmd.usr=1;
+        // Wait the transaction to finish
+        while (host->hw->cmd.usr);
+
+        // *** transfer received data to input buffer ***
+        rdidx = 0;
+        while (rdbits > 0) {
+            wd = host->hw->data_buf[rdidx];
+            rdidx++;
+            for (bc=0;bc<32;bc+=8) {
+                rxbuffer[rd_read++] = (uint8_t)((wd >> bc) & 0xFF);
+                rdcount--;
+                rdbits -= 8;
+                if (rdcount == 0) break;
+            }
+        }
+    }
+
+    // ** Call post-transmission callback, if any
+    if (handle->cfg.post_cb) handle->cfg.post_cb(trans);
+
+    if (do_deselect) {
+        ret = spi_device_deselect(handle);
+        if (ret) return ret;
+    }
+
+    return ESP_OK;
+}
